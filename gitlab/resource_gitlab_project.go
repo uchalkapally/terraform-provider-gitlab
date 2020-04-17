@@ -3,6 +3,7 @@ package gitlab
 import (
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
@@ -119,6 +120,10 @@ var resourceGitLabProjectSchema = map[string]*schema.Schema{
 		ValidateFunc: validation.StringInSlice([]string{"merge", "rebase_merge", "ff"}, true),
 		Default:      "merge",
 	},
+	"forked_from_project_id": {
+		Type:     schema.TypeInt,
+		Optional: true,
+	},
 	"only_allow_merge_if_pipeline_succeeds": {
 		Type:     schema.TypeBool,
 		Optional: true,
@@ -221,6 +226,11 @@ func resourceGitlabProjectSetToState(d *schema.ResourceData, project *gitlab.Pro
 	d.Set("lfs_enabled", project.LFSEnabled)
 	d.Set("visibility_level", string(project.Visibility))
 	d.Set("merge_method", string(project.MergeMethod))
+	if project.ForkedFromProject != nil {
+		d.Set("forked_from_project_id", project.ForkedFromProject.ID)
+	} else {
+		d.Set("forked_from_project_id", nil)
+	}
 	d.Set("only_allow_merge_if_pipeline_succeeds", project.OnlyAllowMergeIfPipelineSucceeds)
 	d.Set("only_allow_merge_if_all_discussions_are_resolved", project.OnlyAllowMergeIfAllDiscussionsAreResolved)
 	d.Set("namespace_id", project.Namespace.ID)
@@ -338,6 +348,15 @@ func resourceGitlabProjectCreate(d *schema.ResourceData, meta interface{}) error
 		d.SetPartial(("archived"))
 	}
 
+	if v, ok := d.GetOk("forked_from_project_id"); ok {
+		if v.(int) > 0 {
+			if err := createForkRelation(project.ID, v.(int), meta); err != nil {
+				log.Printf("[WARN] New project (%s) could not be created because fork relationship from project %d failed: error %#v", d.Id(), v.(int), err)
+				return err
+			}
+			d.SetPartial("forked_from_project_id")
+		}
+	}
 	// everything went OK, we can revert to ordinary state management
 	// and let the Gitlab server fill in the resource state via a read
 	d.Partial(false)
@@ -520,6 +539,26 @@ func resourceGitlabProjectUpdate(d *schema.ResourceData, meta interface{}) error
 			}
 		}
 		d.SetPartial("archived")
+	}
+
+	if d.HasChange("forked_from_project_id") {
+		test1, test2 := d.GetOk("forked_from_project_id")
+		log.Printf("[DEBUG] Getting fork relation v=%v, ok=%v", test1, test2)
+		projectID, err := strconv.Atoi(d.Id())
+		if err != nil {
+			return err
+		}
+		if v, ok := d.GetOk("forked_from_project_id"); ok {
+			_ = deleteForkRelation(projectID, meta)
+			if err := createForkRelation(projectID, v.(int), meta); err != nil {
+				return err
+			}
+		} else {
+			if err := deleteForkRelation(projectID, meta); err != nil {
+				return err
+			}
+		}
+		d.SetPartial("forked_from_project_id")
 	}
 
 	d.Partial(false)
@@ -721,5 +760,23 @@ func unarchiveProject(d *schema.ResourceData, meta interface{}) error {
 		return fmt.Errorf("error unarchiving project (%s): its status on the server is still archived", d.Id())
 	}
 	log.Printf("[TRACE] Project (%s) unarchived", d.Id())
+	return nil
+}
+
+func createForkRelation(projectID int, forkedFromProjectID int, meta interface{}) error {
+	log.Printf("[DEBUG] Project (%d) will be forked from (%d)", projectID, forkedFromProjectID)
+	client := meta.(*gitlab.Client)
+	if _, _, err := client.Projects.CreateProjectForkRelation(projectID, forkedFromProjectID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func deleteForkRelation(projectID int, meta interface{}) error {
+	log.Printf("[DEBUG] Project (%d) will be delete its fork relationship", projectID)
+	client := meta.(*gitlab.Client)
+	if _, err := client.Projects.DeleteProjectForkRelation(projectID); err != nil {
+		return err
+	}
 	return nil
 }
